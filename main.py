@@ -1,10 +1,11 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
+import onnxruntime as ort
+import numpy as np
 from PIL import Image
 import io
 
-app = FastAPI(title="AGRIGUARD API", version="2.5")
+app = FastAPI(title="AGRIGUARD API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -14,7 +15,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-model = YOLO("best.pt")
+# Load lightweight ONNX model session (<120MB RAM usage)
+session = ort.InferenceSession("best.onnx", providers=["CPUExecutionProvider"])
+input_name = session.get_inputs()[0].name
+
+CLASSES = {
+    0: "Potato___Early_blight",
+    1: "Potato___Late_blight",
+    2: "Potato___healthy"
+}
 
 DISEASE_INFO = {
     "Potato___Early_blight": {
@@ -96,17 +105,27 @@ async def predict_leaf_disease(
     image_bytes = await file.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     
-    results = model(image)
-    result = results[0]
+    # Preprocess image to 224x224 float32 tensor
+    image = image.resize((224, 224))
+    img_array = np.array(image, dtype=np.float32) / 255.0
+    img_array = np.transpose(img_array, (2, 0, 1))  # HWC to CHW
+    img_array = np.expand_dims(img_array, axis=0)   # Batch dim [1, 3, 224, 224]
     
-    top1_index = result.probs.top1
-    confidence = float(result.probs.top1conf) * 100
-    raw_class_name = model.names[top1_index]
+    # Lightweight ONNX inference
+    outputs = session.run(None, {input_name: img_array})
+    probs = outputs[0][0]
+    
+    exp_probs = np.exp(probs - np.max(probs))
+    softmax_probs = exp_probs / exp_probs.sum()
+    
+    top1_index = int(np.argmax(softmax_probs))
+    confidence = float(softmax_probs[top1_index]) * 100
+    raw_class_name = CLASSES.get(top1_index, "Potato___healthy")
     
     details = DISEASE_INFO.get(raw_class_name, {
         "disease_name": {"en": f"{crop_type.title()} Condition", "bm": f"Keadaan {crop_type.title()}"},
         "severity": {"en": "Moderate", "bm": "Sederhana"},
-        "summary": {"en": "Condition detected on leaf surface.", "bm": "Keadaan dikesan pada permukaan daun."},
+        "summary": {"en": "Condition detected.", "bm": "Keadaan dikesan."},
         "treatment_today": {"en": ["Monitor plant health."], "bm": ["Pantau kesihatan tumbuhan."]}
     })
     
