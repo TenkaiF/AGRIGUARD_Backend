@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 import io
 
-app = FastAPI(title="AGRIGUARD API", version="3.0")
+app = FastAPI(title="AGRIGUARD API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,6 +19,7 @@ app.add_middleware(
 session = ort.InferenceSession("best.onnx", providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
 
+# Class index mapping matching dataset training directory order
 CLASSES = {
     0: "Potato___Early_blight",
     1: "Potato___Late_blight",
@@ -87,9 +88,9 @@ DISEASE_INFO = {
 }
 
 def get_certainty_labels(confidence_pct: float):
-    if confidence_pct >= 90.0:
+    if confidence_pct >= 85.0:
         return {"en": "Very Certain", "bm": "Sangat Yakin"}
-    elif confidence_pct >= 70.0:
+    elif confidence_pct >= 60.0:
         return {"en": "Likely", "bm": "Kemungkinan Besar"}
     else:
         return {"en": "Uncertain", "bm": "Tidak Pasti"}
@@ -109,31 +110,29 @@ async def predict_leaf_disease(
     image_bytes = await file.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     
-    # 1. Resize to 224x224
-    image = image.resize((224, 224))
+    # 1. Standard YOLOv8 Classification Resize (224x224)
+    image = image.resize((224, 224), Image.Resampling.BILINEAR)
     
-    # 2. Normalize float32 to [0, 1]
-    img_array = np.array(image, dtype=np.float32) / 255.0
+    # 2. Scale pixel values strictly to [0.0, 1.0] (NO ImageNet mean/std subtraction)
+    img_np = np.array(image, dtype=np.float32) / 255.0
     
-    # 3. Apply ImageNet Mean & Std Normalization
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    img_array = (img_array - mean) / std
+    # 3. Reorder HWC [224, 224, 3] -> CHW [3, 224, 224] & Add Batch Dimension [1, 3, 224, 224]
+    img_np = np.transpose(img_np, (2, 0, 1))
+    img_np = np.expand_dims(img_np, axis=0)
     
-    # 4. Transpose from HWC [224, 224, 3] to CHW [3, 224, 224] and add batch dimension [1, 3, 224, 224]
-    img_array = np.transpose(img_array, (2, 0, 1))
-    img_array = np.expand_dims(img_array, axis=0)
+    # 4. Run ONNX Inference
+    outputs = session.run(None, {input_name: img_np})
+    logits = outputs[0][0]
     
-    # 5. Execute ONNX Inference
-    outputs = session.run(None, {input_name: img_array})
-    probs = outputs[0][0]
-    
-    # Softmax
-    exp_probs = np.exp(probs - np.max(probs))
-    softmax_probs = exp_probs / exp_probs.sum()
+    # 5. Numerically stable Softmax calculation
+    exp_logits = np.exp(logits - np.max(logits))
+    softmax_probs = exp_logits / exp_logits.sum()
     
     top1_index = int(np.argmax(softmax_probs))
     confidence = float(softmax_probs[top1_index]) * 100
+    
+    print(f"DEBUG: Logits={logits}, Softmax={softmax_probs}, TopIndex={top1_index}, Conf={confidence:.2f}%")
+    
     raw_class_name = CLASSES.get(top1_index, "Potato___healthy")
     
     details = DISEASE_INFO.get(raw_class_name, {
