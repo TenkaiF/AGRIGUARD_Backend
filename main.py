@@ -5,7 +5,7 @@ import numpy as np
 from PIL import Image
 import io
 
-app = FastAPI(title="AGRIGUARD API", version="3.1")
+app = FastAPI(title="AGRIGUARD API", version="3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,11 +15,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load lightweight ONNX model session
 session = ort.InferenceSession("best.onnx", providers=["CPUExecutionProvider"])
 input_name = session.get_inputs()[0].name
 
-# Class index mapping matching dataset training directory order
 CLASSES = {
     0: "Potato___Early_blight",
     1: "Potato___Late_blight",
@@ -88,7 +86,7 @@ DISEASE_INFO = {
 }
 
 def get_certainty_labels(confidence_pct: float):
-    if confidence_pct >= 85.0:
+    if confidence_pct >= 80.0:
         return {"en": "Very Certain", "bm": "Sangat Yakin"}
     elif confidence_pct >= 60.0:
         return {"en": "Likely", "bm": "Kemungkinan Besar"}
@@ -110,28 +108,25 @@ async def predict_leaf_disease(
     image_bytes = await file.read()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     
-    # 1. Standard YOLOv8 Classification Resize (224x224)
+    # 1. Resize image to 224x224
     image = image.resize((224, 224), Image.Resampling.BILINEAR)
     
-    # 2. Scale pixel values strictly to [0.0, 1.0] (NO ImageNet mean/std subtraction)
+    # 2. Scale pixel values to [0.0, 1.0]
     img_np = np.array(image, dtype=np.float32) / 255.0
     
-    # 3. Reorder HWC [224, 224, 3] -> CHW [3, 224, 224] & Add Batch Dimension [1, 3, 224, 224]
+    # 3. Transpose HWC [224, 224, 3] -> CHW [3, 224, 224] & Add Batch Dim [1, 3, 224, 224]
     img_np = np.transpose(img_np, (2, 0, 1))
     img_np = np.expand_dims(img_np, axis=0)
     
-    # 4. Run ONNX Inference
+    # 4. Execute ONNX Inference
     outputs = session.run(None, {input_name: img_np})
-    logits = outputs[0][0]
+    raw_output = outputs[0][0]
     
-    # 5. Numerically stable Softmax calculation
-    exp_logits = np.exp(logits - np.max(logits))
-    softmax_probs = exp_logits / exp_logits.sum()
+    # Direct readout (ONNX graph already outputs class probabilities)
+    top1_index = int(np.argmax(raw_output))
+    confidence = float(raw_output[top1_index]) * 100
     
-    top1_index = int(np.argmax(softmax_probs))
-    confidence = float(softmax_probs[top1_index]) * 100
-    
-    print(f"DEBUG: Logits={logits}, Softmax={softmax_probs}, TopIndex={top1_index}, Conf={confidence:.2f}%")
+    print(f"DEBUG: Output={raw_output}, TopIndex={top1_index}, TrueConf={confidence:.2f}%")
     
     raw_class_name = CLASSES.get(top1_index, "Potato___healthy")
     
